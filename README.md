@@ -157,7 +157,6 @@ sudo mydns rollback -y
 
 <div align="center">
 
-**SuperTurbo3XUI**  
 *Less manual work. More control over your server.*
 
 </div>
