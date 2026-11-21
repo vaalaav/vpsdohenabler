@@ -2,7 +2,7 @@
 # ==============================================================================
 # Interactive System DoH (DNS-over-HTTPS) Manager for Ubuntu 24.04 VPS
 # Uses AdGuardTeam/dnsproxy on 127.0.0.1:53 with full audit & safe rollback
-# Supports IPv4-only, broken-IPv6, and dual-stack servers
+# Supports 1-3 DoH providers (load_balance / strict fallback) & IPv4-only VPS
 # ==============================================================================
 
 set -uo pipefail
@@ -11,6 +11,8 @@ set -uo pipefail
 readonly BIN_PATH="/usr/local/bin/dnsproxy"
 readonly CONFIG_DIR="/etc/vps-doh"
 readonly ENV_FILE="${CONFIG_DIR}/doh.env"
+readonly UPSTREAMS_FILE="${CONFIG_DIR}/upstreams.txt"
+readonly FALLBACKS_FILE="${CONFIG_DIR}/fallbacks.txt"
 readonly BACKUP_DIR="/var/backups/vps-doh"
 readonly SERVICE_NAME="vps-doh"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -19,6 +21,11 @@ readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CURL_IP_FLAG=""
 HAS_IPV4=0
 HAS_IPV6=0
+
+# Выбранные провайдеры (от 1 до 3)
+SELECTED_NAMES=()
+SELECTED_URLS=()
+SELECTED_MODE="single"
 
 # --- Цвета ---
 RED='\033[0;31m'
@@ -303,50 +310,127 @@ install_dnsproxy_binary() {
     ok "Установлен dnsproxy: $("$BIN_PATH" --version 2>&1 | head -n 1)"
 }
 
-# --- Выбор провайдера DoH ---
-select_doh_provider() {
-    header "Выбор DoH DNS провайдера"
-    echo "  1) Cloudflare         (https://cloudflare-dns.com/dns-query)        — максимальная скорость"
-    echo "  2) Quad9              (https://dns.quad9.net/dns-query)             — защита от угроз, без логов"
-    echo "  3) Google Public DNS  (https://dns.google/dns-query)                — высокая стабильность"
-    echo "  4) AdGuard (Default)  (https://dns.adguard-dns.com/dns-query)       — с блокировкой рекламы"
-    echo "  5) AdGuard (Clean)    (https://unfiltered.adguard-dns.com/dns-query)— без фильтрации"
-    echo "  6) Mullvad DNS        (https://dns.mullvad.net/dns-query)           — фокус на приватность"
-    echo "  7) Указать свой DoH адрес (например, NextDNS, ControlD или свой сервер)"
-    echo ""
-
-    while true; do
-        read -rp "Выберите вариант [1-7]: " choice
-        case "$choice" in
-            1) SELECTED_NAME="Cloudflare";        SELECTED_URL="https://cloudflare-dns.com/dns-query"; break ;;
-            2) SELECTED_NAME="Quad9";             SELECTED_URL="https://dns.quad9.net/dns-query"; break ;;
-            3) SELECTED_NAME="Google Public DNS"; SELECTED_URL="https://dns.google/dns-query"; break ;;
-            4) SELECTED_NAME="AdGuard Default";   SELECTED_URL="https://dns.adguard-dns.com/dns-query"; break ;;
-            5) SELECTED_NAME="AdGuard Clean";     SELECTED_URL="https://unfiltered.adguard-dns.com/dns-query"; break ;;
-            6) SELECTED_NAME="Mullvad DNS";       SELECTED_URL="https://dns.mullvad.net/dns-query"; break ;;
-            7)
-                echo ""
-                read -rp "Введите полный DoH URL (начинается с https://): " custom_url
-                custom_url="${custom_url// /}"
-                if [[ "$custom_url" =~ ^https://.+ ]]; then
-                    SELECTED_NAME="Custom DoH"
-                    SELECTED_URL="$custom_url"
-                    break
-                else
-                    err "Некорректный формат. URL должен начинаться с https:// (например: https://dns.nextdns.io/abc123)."
-                fi
-                ;;
-            *) err "Введите число от 1 до 7." ;;
-        esac
+# --- Проверка дубликата URL ---
+is_url_selected() {
+    local check_url="$1"
+    local u
+    for u in "${SELECTED_URLS[@]+"${SELECTED_URLS[@]}"}"; do
+        [[ "$u" == "$check_url" ]] && return 0
     done
-
-    ok "Выбран провайдер: ${SELECTED_NAME} (${SELECTED_URL})"
+    return 1
 }
 
-# --- Предварительный тест выбранного DoH до переключения системы ---
-pretest_doh_upstream() {
-    local url="$1"
-    info "Предварительный тест DoH-сервера ${url} на временном порту 53535..."
+# --- Выбор от 1 до 3 провайдеров DoH ---
+select_doh_providers() {
+    SELECTED_NAMES=()
+    SELECTED_URLS=()
+    SELECTED_MODE="single"
+
+    local slot
+    for slot in 1 2 3; do
+        header "Выбор DoH DNS провайдера (${slot} из 3)"
+
+        if [[ ${#SELECTED_URLS[@]} -gt 0 ]]; then
+            info "Уже выбрано:"
+            local idx
+            for idx in "${!SELECTED_URLS[@]}"; do
+                echo -e "    $((idx + 1))) ${BOLD}${SELECTED_NAMES[$idx]}${NC} (${SELECTED_URLS[$idx]})"
+            done
+            echo ""
+        fi
+
+        echo "  1) Cloudflare         (https://cloudflare-dns.com/dns-query)        — максимальная скорость"
+        echo "  2) Quad9              (https://dns.quad9.net/dns-query)             — защита от угроз, без логов"
+        echo "  3) Google Public DNS  (https://dns.google/dns-query)                — высокая стабильность"
+        echo "  4) AdGuard (Default)  (https://dns.adguard-dns.com/dns-query)       — с блокировкой рекламы"
+        echo "  5) AdGuard (Clean)    (https://unfiltered.adguard-dns.com/dns-query)— без фильтрации"
+        echo "  6) Mullvad DNS        (https://dns.mullvad.net/dns-query)           — фокус на приватность"
+        echo "  7) Указать свой DoH адрес (например, NextDNS, ControlD или свой сервер)"
+        if [[ "$slot" -gt 1 ]]; then
+            echo "  0) Завершить выбор (оставить выбранных: ${#SELECTED_URLS[@]})"
+        fi
+        echo ""
+
+        local picked_name=""
+        local picked_url=""
+        local done_selecting=0
+
+        while true; do
+            if [[ "$slot" -eq 1 ]]; then
+                read -rp "Выберите основной провайдер #1 [1-7]: " choice
+            else
+                read -rp "Выберите резервный провайдер #${slot} [0-7] (0 = хватит): " choice
+            fi
+
+            if [[ "$slot" -gt 1 && ( "$choice" == "0" || -z "$choice" ) ]]; then
+                done_selecting=1
+                break
+            fi
+
+            case "$choice" in
+                1) picked_name="Cloudflare";        picked_url="https://cloudflare-dns.com/dns-query" ;;
+                2) picked_name="Quad9";             picked_url="https://dns.quad9.net/dns-query" ;;
+                3) picked_name="Google Public DNS"; picked_url="https://dns.google/dns-query" ;;
+                4) picked_name="AdGuard Default";   picked_url="https://dns.adguard-dns.com/dns-query" ;;
+                5) picked_name="AdGuard Clean";     picked_url="https://unfiltered.adguard-dns.com/dns-query" ;;
+                6) picked_name="Mullvad DNS";       picked_url="https://dns.mullvad.net/dns-query" ;;
+                7)
+                    echo ""
+                    read -rp "Введите полный DoH URL (начинается с https://): " custom_url
+                    custom_url="${custom_url// /}"
+                    if [[ "$custom_url" =~ ^https://.+ ]]; then
+                        picked_name="Custom DoH #${slot}"
+                        picked_url="$custom_url"
+                    else
+                        err "Некорректный формат. URL должен начинаться с https:// (например: https://dns.nextdns.io/abc123)."
+                        continue
+                    fi
+                    ;;
+                *)
+                    err "Некорректный ввод."
+                    continue
+                    ;;
+            esac
+
+            if is_url_selected "$picked_url"; then
+                warn "Этот DoH-адрес уже добавлен в список. Выберите другой."
+                continue
+            fi
+
+            SELECTED_NAMES+=("$picked_name")
+            SELECTED_URLS+=("$picked_url")
+            ok "Добавлен провайдер #${slot}: ${picked_name} (${picked_url})"
+            break
+        done
+
+        [[ "$done_selecting" -eq 1 ]] && break
+    done
+
+    # Выбор режима отказоустойчивости при выборе 2 или 3 провайдеров
+    if [[ ${#SELECTED_URLS[@]} -gt 1 ]]; then
+        echo ""
+        header "Режим переключения между провайдерами"
+        echo "  1) Автобалансировка и быстрое переключение (load_balance) [рекомендуется]"
+        echo "     dnsproxy сам выбирает самый быстрый живой сервер и мгновенно обходит упавшие."
+        echo "  2) Строгий приоритет (основной + резервные fallback)"
+        echo "     Всегда используется #1 (${SELECTED_NAMES[0]}). Остальные включаются только при его сбое."
+        echo ""
+        read -rp "Выберите режим [1-2] (по умолчанию 1): " mode_choice
+        case "$mode_choice" in
+            2) SELECTED_MODE="fallback" ;;
+            *) SELECTED_MODE="load_balance" ;;
+        esac
+        ok "Выбран режим работы: ${SELECTED_MODE}"
+    else
+        SELECTED_MODE="single"
+    fi
+}
+
+# --- Тест одного DoH-сервера на временном порту ---
+test_single_doh_upstream() {
+    local name="$1"
+    local url="$2"
+    info "Тест DoH [${name}]: ${url}..."
 
     "$BIN_PATH" -l 127.0.0.1 -p 53535 -u "$url" -b 1.1.1.1:53 -b 9.9.9.9:53 -b 8.8.8.8:53 >/dev/null 2>&1 &
     local test_pid=$!
@@ -357,13 +441,13 @@ pretest_doh_upstream() {
         local res
         res=$(dig -4 @127.0.0.1 -p 53535 cloudflare.com A +short +time=4 +tries=1 2>/dev/null | head -n 1)
         if [[ -n "$res" && ! "$res" =~ ^\; ]]; then
-            ok "Тестовый DoH-запрос успешен (cloudflare.com -> ${res})."
+            ok "  [${name}] работает (cloudflare.com -> ${res})."
             test_ok=1
         fi
     else
         if safe_curl -fsS --max-time 5 -o /dev/null "${url}?name=cloudflare.com&type=A" \
            -H "accept: application/dns-json" 2>/dev/null || safe_curl -sI --max-time 5 "$url" >/dev/null 2>&1; then
-            ok "DoH-сервер отвечает по HTTPS."
+            ok "  [${name}] отвечает по HTTPS."
             test_ok=1
         fi
     fi
@@ -371,10 +455,44 @@ pretest_doh_upstream() {
     kill "$test_pid" 2>/dev/null || true
     wait "$test_pid" 2>/dev/null || true
 
-    if [[ "$test_ok" -ne 1 ]]; then
-        err "Выбранный DoH-сервер (${url}) не ответил на тестовый запрос!"
+    [[ "$test_ok" -eq 1 ]] && return 0 || return 1
+}
+
+# --- Предварительный тест всех выбранных DoH-провайдеров ---
+pretest_all_selected() {
+    header "Предварительное тестирование выбранных DoH-серверов"
+    local working_names=()
+    local working_urls=()
+    local failed_count=0
+    local i
+
+    for i in "${!SELECTED_URLS[@]}"; do
+        if test_single_doh_upstream "${SELECTED_NAMES[$i]}" "${SELECTED_URLS[$i]}"; then
+            working_names+=("${SELECTED_NAMES[$i]}")
+            working_urls+=("${SELECTED_URLS[$i]}")
+        else
+            err "  [${SELECTED_NAMES[$i]}] (${SELECTED_URLS[$i]}) не ответил!"
+            failed_count=$((failed_count + 1))
+        fi
+    done
+
+    if [[ ${#working_urls[@]} -eq 0 ]]; then
+        err "Ни один из выбранных DoH-серверов не прошёл проверку!"
         return 1
     fi
+
+    if [[ "$failed_count" -gt 0 ]]; then
+        echo ""
+        warn "Часть серверов (${failed_count}) не прошла проверку. Рабочих осталось: ${#working_urls[@]}."
+        read -rp "Продолжить установку только с рабочими серверами? [Y/n]: " keep_working
+        if [[ "$keep_working" =~ ^[Nn]$ ]]; then
+            return 1
+        fi
+        SELECTED_NAMES=("${working_names[@]}")
+        SELECTED_URLS=("${working_urls[@]}")
+        [[ ${#SELECTED_URLS[@]} -eq 1 ]] && SELECTED_MODE="single"
+    fi
+
     return 0
 }
 
@@ -406,13 +524,43 @@ backup_original_state() {
 
 # --- Применение конфигурации и запуск сервиса ---
 apply_doh_config() {
-    local name="$1"
-    local url="$2"
-
     mkdir -p "$CONFIG_DIR"
+
+    # Очищаем старые файлы списков
+    : > "$UPSTREAMS_FILE"
+    rm -f "$FALLBACKS_FILE"
+
+    local exec_extra=""
+    if [[ "$SELECTED_MODE" == "fallback" && ${#SELECTED_URLS[@]} -gt 1 ]]; then
+        # #1 — основной upstream, #2..#3 — резервные fallback
+        echo "${SELECTED_URLS[0]}" > "$UPSTREAMS_FILE"
+        : > "$FALLBACKS_FILE"
+        local i
+        for (( i=1; i<${#SELECTED_URLS[@]}; i++ )); do
+            echo "${SELECTED_URLS[$i]}" >> "$FALLBACKS_FILE"
+        done
+        exec_extra="-f ${FALLBACKS_FILE}"
+    else
+        # Один или несколько upstreams с автобалансировкой и failover
+        local u
+        for u in "${SELECTED_URLS[@]}"; do
+            echo "$u" >> "$UPSTREAMS_FILE"
+        done
+        if [[ ${#SELECTED_URLS[@]} -gt 1 ]]; then
+            exec_extra="--upstream-mode=load_balance"
+        fi
+    fi
+
+    # Сохраняем метаданные для отображения статуса
+    local joined_names joined_urls
+    joined_names=$(IFS=', '; echo "${SELECTED_NAMES[*]}")
+    joined_urls=$(IFS=', '; echo "${SELECTED_URLS[*]}")
+
     cat > "$ENV_FILE" <<EOF
-DOH_NAME="${name}"
-DOH_UPSTREAM="${url}"
+DOH_MODE="${SELECTED_MODE}"
+DOH_COUNT="${#SELECTED_URLS[@]}"
+DOH_NAMES="${joined_names}"
+DOH_URLS="${joined_urls}"
 EOF
 
     cat > "$SERVICE_FILE" <<EOF
@@ -423,8 +571,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=${ENV_FILE}
-ExecStart=${BIN_PATH} -l 127.0.0.1 -p 53 -u \${DOH_UPSTREAM} -b 1.1.1.1:53 -b 9.9.9.9:53 -b 8.8.8.8:53 --cache --cache-optimistic --refuse-any
+ExecStart=${BIN_PATH} -l 127.0.0.1 -p 53 -u ${UPSTREAMS_FILE} ${exec_extra} -b 1.1.1.1:53 -b 9.9.9.9:53 -b 8.8.8.8:53 --cache --cache-optimistic --refuse-any
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
@@ -456,7 +603,7 @@ EOF
     chattr -i /etc/resolv.conf 2>/dev/null || true
     rm -f /etc/resolv.conf
     cat > /etc/resolv.conf <<EOF
-# Managed by vps-doh (${name})
+# Managed by vps-doh (${joined_names} | mode: ${SELECTED_MODE})
 nameserver 127.0.0.1
 options edns0 trust-ad
 EOF
@@ -491,8 +638,19 @@ verify_doh() {
     if [[ -f "$ENV_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$ENV_FILE"
-        info "Текущий DoH upstream: ${DOH_NAME:-unknown} -> ${DOH_UPSTREAM:-unknown}"
+        info "Режим: ${DOH_MODE:-single} | Провайдеров: ${DOH_COUNT:-1}"
+        info "Провайдеры: ${DOH_NAMES:-${DOH_NAME:-unknown}}"
     fi
+
+    if [[ -f "$UPSTREAMS_FILE" ]]; then
+        info "Основные DoH upstreams (${UPSTREAMS_FILE}):"
+        sed 's/^/    /' "$UPSTREAMS_FILE"
+    fi
+    if [[ -f "$FALLBACKS_FILE" ]]; then
+        info "Резервные DoH fallbacks (${FALLBACKS_FILE}):"
+        sed 's/^/    /' "$FALLBACKS_FILE"
+    fi
+
     info "Содержимое /etc/resolv.conf:"
     grep -v '^#' /etc/resolv.conf 2>/dev/null | sed 's/^/    /'
     if command -v lsattr >/dev/null 2>&1; then
@@ -618,20 +776,20 @@ action_install() {
     [[ "$confirm" =~ ^[Nn]$ ]] && return 0
 
     install_dnsproxy_binary || return 1
-    select_doh_provider
+    select_doh_providers
 
-    if ! pretest_doh_upstream "$SELECTED_URL"; then
-        read -rp "Тест не прошёл. Попробовать другой DoH провайдер? [Y/n]: " retry
+    if ! pretest_all_selected; then
+        read -rp "Повторить выбор DoH-провайдеров? [Y/n]: " retry
         if [[ ! "$retry" =~ ^[Nn]$ ]]; then
-            select_doh_provider
-            pretest_doh_upstream "$SELECTED_URL" || { err "Повторный тест не прошёл. Отмена."; return 1; }
+            select_doh_providers
+            pretest_all_selected || { err "Повторный тест не прошёл. Отмена."; return 1; }
         else
             return 1
         fi
     fi
 
     backup_original_state
-    apply_doh_config "$SELECTED_NAME" "$SELECTED_URL"
+    apply_doh_config
 
     if ! verify_doh; then
         err "После применения настроек DNS работает некорректно!"
@@ -641,11 +799,11 @@ action_install() {
         fi
     else
         echo ""
-        ok "Готово! Системный DoH DNS (${SELECTED_NAME}) успешно настроен и закреплён."
+        ok "Готово! Системный DoH DNS успешно настроен и закреплён."
     fi
 }
 
-# --- Быстрая смена провайдера ---
+# --- Быстрая смена провайдеров ---
 action_change_provider() {
     if [[ ! -x "$BIN_PATH" ]]; then
         warn "DoH ещё не установлен. Запускаем полную установку..."
@@ -654,13 +812,13 @@ action_change_provider() {
     fi
 
     detect_network_stack
-    select_doh_provider
-    if ! pretest_doh_upstream "$SELECTED_URL"; then
-        err "Новый DoH-сервер не прошёл тест. Изменения не применены."
+    select_doh_providers
+    if ! pretest_all_selected; then
+        err "Проверка выбранных серверов не пройдена. Изменения не применены."
         return 1
     fi
 
-    apply_doh_config "$SELECTED_NAME" "$SELECTED_URL"
+    apply_doh_config
     verify_doh
 }
 
@@ -676,14 +834,15 @@ main_menu() {
         if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && [[ -f "$ENV_FILE" ]]; then
             # shellcheck disable=SC1090
             source "$ENV_FILE"
-            echo -e " Статус: ${GREEN}АКТИВЕН${NC} | Провайдер: ${BOLD}${DOH_NAME:-?}${NC} (${DOH_UPSTREAM:-?})"
+            echo -e " Статус: ${GREEN}АКТИВЕН${NC} | Режим: ${BOLD}${DOH_MODE:-single}${NC} (${DOH_COUNT:-1} пров.)"
+            echo -e " Провайдеры: ${BOLD}${DOH_NAMES:-${DOH_NAME:-?}}${NC}"
         else
             echo -e " Статус: ${YELLOW}НЕ УСТАНОВЛЕН (используется системный DNS)${NC}"
         fi
         echo "----------------------------------------------------"
-        echo "  1) Установить и настроить DoH DNS (с аудитом)"
+        echo "  1) Установить и настроить DoH DNS (1–3 провайдера)"
         echo "  2) Проверить статус и работу DNS"
-        echo "  3) Сменить DoH провайдера"
+        echo "  3) Сменить DoH провайдеров (1–3 шт.)"
         echo "  4) Откатить всё к стандартным настройкам (Удалить)"
         echo "  0) Выход"
         echo "----------------------------------------------------"
