@@ -2,6 +2,7 @@
 # ==============================================================================
 # Interactive System DoH (DNS-over-HTTPS) Manager for Ubuntu 24.04 VPS
 # Uses AdGuardTeam/dnsproxy on 127.0.0.1:53 with full audit & safe rollback
+# Supports IPv4-only, broken-IPv6, and dual-stack servers
 # ==============================================================================
 
 set -uo pipefail
@@ -13,6 +14,11 @@ readonly ENV_FILE="${CONFIG_DIR}/doh.env"
 readonly BACKUP_DIR="/var/backups/vps-doh"
 readonly SERVICE_NAME="vps-doh"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# Сетевой стек (определяется автоматически)
+CURL_IP_FLAG=""
+HAS_IPV4=0
+HAS_IPV6=0
 
 # --- Цвета ---
 RED='\033[0;31m'
@@ -52,6 +58,38 @@ detect_arch() {
     esac
 }
 
+# --- Определение рабочего сетевого стека (IPv4 / IPv6) ---
+detect_network_stack() {
+    HAS_IPV4=0
+    HAS_IPV6=0
+    CURL_IP_FLAG=""
+
+    if curl -4 -fsSI --max-time 5 https://github.com >/dev/null 2>&1 || \
+       curl -4 -fsSI --max-time 5 https://1.1.1.1 >/dev/null 2>&1; then
+        HAS_IPV4=1
+    fi
+
+    if curl -6 -fsSI --max-time 4 https://cloudflare.com >/dev/null 2>&1; then
+        HAS_IPV6=1
+    fi
+
+    # Предпочитаем IPv4 для curl, чтобы исключить таймауты на сломанном IPv6
+    if [[ "$HAS_IPV4" -eq 1 ]]; then
+        CURL_IP_FLAG="-4"
+    elif [[ "$HAS_IPV6" -eq 1 ]]; then
+        CURL_IP_FLAG="-6"
+    fi
+}
+
+# Обёртка над curl с учётом доступного стека
+safe_curl() {
+    if [[ -n "$CURL_IP_FLAG" ]]; then
+        curl "$CURL_IP_FLAG" "$@"
+    else
+        curl "$@"
+    fi
+}
+
 # --- Проверка наличия базовых утилит ---
 ensure_dependencies() {
     local missing=()
@@ -64,7 +102,9 @@ ensure_dependencies() {
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         info "Устанавливаем недостающие утилиты: ${missing[*]}..."
-        apt-get update -qq && apt-get install -y -qq curl tar iproute2 dnsutils >/dev/null 2>&1 || {
+        local apt_opts=()
+        [[ "$HAS_IPV6" -eq 0 && "$HAS_IPV4" -eq 1 ]] && apt_opts=(-o Acquire::ForceIPv4=true)
+        apt-get "${apt_opts[@]}" update -qq && apt-get "${apt_opts[@]}" install -y -qq curl tar iproute2 dnsutils >/dev/null 2>&1 || {
             warn "Не удалось автоматически установить часть утилит, продолжаем с тем, что есть."
         }
     fi
@@ -103,7 +143,28 @@ run_preflight_audit() {
         ok "Архитектура: $(uname -m) (dnsproxy: linux-${arch})"
     fi
 
-    # 3. Порт 53
+    # 3. Сетевой стек (IPv4 / IPv6)
+    echo ""
+    info "Проверка сетевого стека (IPv4 / IPv6):"
+    detect_network_stack
+    if [[ "$HAS_IPV4" -eq 1 ]]; then
+        ok "IPv4: работает (используется как основной стек для загрузки и bootstrap DNS)."
+    else
+        warn "IPv4: недоступен."
+    fi
+
+    if [[ "$HAS_IPV6" -eq 1 ]]; then
+        ok "IPv6: работает."
+    else
+        info "IPv6: отсутствует или недоступен — скрипт автоматически работает в режиме IPv4-only."
+    fi
+
+    if [[ "$HAS_IPV4" -eq 0 && "$HAS_IPV6" -eq 0 ]]; then
+        err "Нет выхода в интернет по HTTPS (порт 443). Проверьте сеть или firewall."
+        has_blocker=1
+    fi
+
+    # 4. Порт 53
     echo ""
     info "Проверка занятости порта 53 (TCP/UDP):"
     local port53_procs
@@ -120,32 +181,28 @@ run_preflight_audit() {
         fi
     fi
 
-    # 4. Проверка установленных сервисов (Nginx, 3x-ui, telemt, Amnezia/Docker)
+    # 5. Проверка установленных сервисов (Nginx, 3x-ui, telemt, Amnezia/Docker)
     echo ""
     info "Проверка совместимости с целевым стеком:"
 
-    # Nginx
     if command -v nginx >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep -q '^nginx\.service'; then
         ok "Nginx обнаружен: совместим (порт 53 не использует, подхватит системный DoH)."
     else
         info "Nginx: не установлен (последующая установка полностью совместима)."
     fi
 
-    # 3x-ui / Xray
     if [[ -d /usr/local/x-ui ]] || systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
         ok "3x-ui обнаружен: совместим (использует системный DNS либо внутренний DNS Xray)."
     else
         info "3x-ui: не установлен (последующая установка полностью совместима)."
     fi
 
-    # telemt web proxy
     if systemctl list-unit-files 2>/dev/null | grep -qi 'telemt' || pgrep -fa 'telemt' >/dev/null 2>&1; then
         ok "telemt proxy обнаружен: совместим (порт 53 не использует)."
     else
         info "telemt proxy: не обнаружен (последующая установка полностью совместима)."
     fi
 
-    # Docker / Amnezia VPN
     if command -v docker >/dev/null 2>&1; then
         local amnezia_cnt
         amnezia_cnt=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -i 'amnezia' | wc -l || echo 0)
@@ -159,7 +216,7 @@ run_preflight_audit() {
         info "Docker / Amnezia VPN: не установлены (последующая установка полностью совместима)."
     fi
 
-    # 5. Поддержка chattr +i (защита от перезаписи resolv.conf)
+    # 6. Поддержка chattr +i (защита от перезаписи resolv.conf)
     echo ""
     local tmp_test="/tmp/.vps_doh_chattr_test"
     touch "$tmp_test"
@@ -170,14 +227,6 @@ run_preflight_audit() {
     else
         rm -f "$tmp_test"
         warn "Файловая система не поддерживает chattr +i (возможно, LXC/OpenVZ). Перезапись /etc/resolv.conf будет предотвращена отключением systemd-resolved."
-    fi
-
-    # 6. Проверка выхода в сеть по HTTPS
-    if curl -fsSI --max-time 5 https://github.com >/dev/null 2>&1; then
-        ok "Доступ в интернет по HTTPS (порт 443) работает."
-    else
-        err "Нет доступа к github.com по HTTPS (порт 443). Проверьте сеть или firewall."
-        has_blocker=1
     fi
 
     return "$has_blocker"
@@ -193,24 +242,44 @@ install_dnsproxy_binary() {
         [[ ! "$ans" =~ ^[Yy]$ ]] && return 0
     fi
 
+    [[ -z "$CURL_IP_FLAG" ]] && detect_network_stack
+
     local arch
     arch=$(detect_arch)
     info "Получаем ссылку на последний релиз AdGuardTeam/dnsproxy (linux-${arch})..."
 
-    local download_url
-    download_url=$(curl -fsSL "https://api.github.com/repos/AdGuardTeam/dnsproxy/releases/latest" \
-        | grep -oE "https://github\.com/AdGuardTeam/dnsproxy/releases/download/[^\"]+dnsproxy-linux-${arch}-v[^\"]+\.tar\.gz" \
-        | head -n 1)
+    local download_url=""
+    local latest_tag=""
+
+    # Способ 1: через HTTP-редирект github.com (без лимитов GitHub API)
+    local redirect_url
+    redirect_url=$(safe_curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 15 \
+        "https://github.com/AdGuardTeam/dnsproxy/releases/latest" 2>/dev/null || true)
+
+    if [[ "$redirect_url" =~ /tag/(v[^/[:space:]]+)$ ]]; then
+        latest_tag="${BASH_REMATCH[1]}"
+        download_url="https://github.com/AdGuardTeam/dnsproxy/releases/download/${latest_tag}/dnsproxy-linux-${arch}-${latest_tag}.tar.gz"
+    fi
+
+    # Способ 2 (резервный): через GitHub API с User-Agent
+    if [[ -z "$download_url" ]]; then
+        warn "Редирект не сработал, пробуем через GitHub API..."
+        download_url=$(safe_curl -fsSL --max-time 15 -H "User-Agent: vps-doh-installer" \
+            "https://api.github.com/repos/AdGuardTeam/dnsproxy/releases/latest" 2>/dev/null \
+            | grep -oE "https://github\.com/AdGuardTeam/dnsproxy/releases/download/[^\"]+dnsproxy-linux-${arch}-v[^\"]+\.tar\.gz" \
+            | head -n 1 || true)
+    fi
 
     if [[ -z "$download_url" ]]; then
-        err "Не удалось получить ссылку на релиз с GitHub API."
+        err "Не удалось получить ссылку на релиз AdGuardTeam/dnsproxy."
+        info "Проверьте доступ вручную: curl -4 -I https://github.com/AdGuardTeam/dnsproxy/releases/latest"
         return 1
     fi
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
     info "Скачиваем: ${download_url}"
-    if ! curl -fsSL "$download_url" -o "${tmp_dir}/dnsproxy.tar.gz"; then
+    if ! safe_curl -fsSL --max-time 60 "$download_url" -o "${tmp_dir}/dnsproxy.tar.gz"; then
         err "Ошибка при скачивании архива."
         rm -rf "$tmp_dir"
         return 1
@@ -226,7 +295,6 @@ install_dnsproxy_binary() {
         return 1
     fi
 
-    # Останавливаем сервис на время замены бинарника, если он уже работает
     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && systemctl stop "$SERVICE_NAME"
 
     install -m 0755 "$extracted_bin" "$BIN_PATH"
@@ -280,22 +348,21 @@ pretest_doh_upstream() {
     local url="$1"
     info "Предварительный тест DoH-сервера ${url} на временном порту 53535..."
 
-    "$BIN_PATH" -l 127.0.0.1 -p 53535 -u "$url" -b 1.1.1.1:53 -b 9.9.9.9:53 >/dev/null 2>&1 &
+    "$BIN_PATH" -l 127.0.0.1 -p 53535 -u "$url" -b 1.1.1.1:53 -b 9.9.9.9:53 -b 8.8.8.8:53 >/dev/null 2>&1 &
     local test_pid=$!
     sleep 1
 
     local test_ok=0
     if command -v dig >/dev/null 2>&1; then
         local res
-        res=$(dig @127.0.0.1 -p 53535 cloudflare.com +short +time=4 +tries=1 2>/dev/null | head -n 1)
+        res=$(dig -4 @127.0.0.1 -p 53535 cloudflare.com A +short +time=4 +tries=1 2>/dev/null | head -n 1)
         if [[ -n "$res" && ! "$res" =~ ^\; ]]; then
             ok "Тестовый DoH-запрос успешен (cloudflare.com -> ${res})."
             test_ok=1
         fi
     else
-        # Запасная проверка доступности HTTPS-эндпоинта, если dig не установлен
-        if curl -fsS --max-time 5 -o /dev/null "${url}?name=cloudflare.com&type=A" \
-           -H "accept: application/dns-json" 2>/dev/null || curl -sI --max-time 5 "$url" >/dev/null 2>&1; then
+        if safe_curl -fsS --max-time 5 -o /dev/null "${url}?name=cloudflare.com&type=A" \
+           -H "accept: application/dns-json" 2>/dev/null || safe_curl -sI --max-time 5 "$url" >/dev/null 2>&1; then
             ok "DoH-сервер отвечает по HTTPS."
             test_ok=1
         fi
@@ -320,11 +387,9 @@ backup_original_state() {
 
     mkdir -p "$BACKUP_DIR"
 
-    # Статус systemd-resolved
     systemctl is-active --quiet systemd-resolved 2>/dev/null && echo "yes" > "${BACKUP_DIR}/resolved.was_active" || echo "no" > "${BACKUP_DIR}/resolved.was_active"
     systemctl is-enabled --quiet systemd-resolved 2>/dev/null && echo "yes" > "${BACKUP_DIR}/resolved.was_enabled" || echo "no" > "${BACKUP_DIR}/resolved.was_enabled"
 
-    # Исходный /etc/resolv.conf
     if [[ -L /etc/resolv.conf ]]; then
         echo "symlink" > "${BACKUP_DIR}/resolv.type"
         readlink /etc/resolv.conf > "${BACKUP_DIR}/resolv.target"
@@ -375,7 +440,6 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 EOF
 
-    # Отключаем systemd-resolved, чтобы освободить порт 53
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         info "Останавливаем и отключаем systemd-resolved..."
         systemctl stop systemd-resolved
@@ -384,13 +448,11 @@ EOF
         systemctl disable systemd-resolved >/dev/null 2>&1 || true
     fi
 
-    # Перезагружаем systemd и запускаем vps-doh
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
     systemctl restart "$SERVICE_NAME"
     sleep 1
 
-    # Настраиваем /etc/resolv.conf
     chattr -i /etc/resolv.conf 2>/dev/null || true
     rm -f /etc/resolv.conf
     cat > /etc/resolv.conf <<EOF
@@ -399,7 +461,6 @@ nameserver 127.0.0.1
 options edns0 trust-ad
 EOF
 
-    # Защищаем от перезаписи (DHCP / netplan / cloud-init)
     if chattr +i /etc/resolv.conf 2>/dev/null; then
         ok "Файл /etc/resolv.conf защищён от перезаписи (chattr +i)."
     else
@@ -412,7 +473,6 @@ verify_doh() {
     header "Проверка работы DoH DNS"
     local failed=0
 
-    # 1. Сервис
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         ok "Сервис ${SERVICE_NAME}: активен (автозапуск включён: $(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || echo no))."
     else
@@ -421,7 +481,6 @@ verify_doh() {
         failed=1
     fi
 
-    # 2. Порт 53
     if ss -tulnp 2>/dev/null | grep -E '127\.0\.0\.1:53\b' | grep -q 'dnsproxy'; then
         ok "Порт 127.0.0.1:53 слушает dnsproxy (публичный доступ извне закрыт)."
     else
@@ -429,7 +488,6 @@ verify_doh() {
         failed=1
     fi
 
-    # 3. Текущий провайдер и /etc/resolv.conf
     if [[ -f "$ENV_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$ENV_FILE"
@@ -443,14 +501,13 @@ verify_doh() {
         [[ "$attrs" == *"i"* ]] && ok "Защита /etc/resolv.conf от слёта: активна (+i)." || warn "Флаг +i на /etc/resolv.conf не установлен."
     fi
 
-    # 4. Реальные DNS-запросы
     echo ""
     info "Тест разрешения имён через системный DNS:"
     local domains=("cloudflare.com" "github.com" "google.com")
     for d in "${domains[@]}"; do
         if command -v dig >/dev/null 2>&1; then
             local out time_ms ip
-            out=$(dig +time=4 +tries=1 "$d" 2>/dev/null)
+            out=$(dig -4 @127.0.0.1 +time=4 +tries=1 "$d" A 2>/dev/null)
             ip=$(echo "$out" | awk '/^[^;].*\sIN\sA\s/ {print $5; exit}')
             time_ms=$(echo "$out" | awk '/Query time:/ {print $4}')
             if [[ -n "$ip" ]]; then
@@ -461,7 +518,7 @@ verify_doh() {
             fi
         else
             local ip
-            ip=$(getent ahosts "$d" 2>/dev/null | awk '{print $1; exit}')
+            ip=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1; exit}')
             if [[ -n "$ip" ]]; then
                 ok "  ${d} -> ${ip}"
             else
@@ -516,11 +573,9 @@ rollback_to_default() {
                 ;;
         esac
     else
-        # Стандартный симлинк для Ubuntu 24.04
         ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
     fi
 
-    # Восстанавливаем systemd-resolved
     local restore_resolved="yes"
     if [[ -f "${BACKUP_DIR}/resolved.was_active" ]]; then
         restore_resolved=$(cat "${BACKUP_DIR}/resolved.was_active")
@@ -540,8 +595,7 @@ rollback_to_default() {
 
     rm -rf "$BACKUP_DIR"
 
-    # Проверка DNS после отката
-    if getent ahosts cloudflare.com >/dev/null 2>&1; then
+    if getent ahostsv4 cloudflare.com >/dev/null 2>&1 || getent ahosts cloudflare.com >/dev/null 2>&1; then
         ok "Системный DNS после отката работает исправно."
     else
         warn "DNS после отката не отвечает! Временно прописываем 1.1.1.1 и 8.8.8.8 в /etc/resolv.conf..."
@@ -552,6 +606,7 @@ rollback_to_default() {
 
 # --- Полный сценарий установки ---
 action_install() {
+    detect_network_stack
     ensure_dependencies
     if ! run_preflight_audit; then
         err "Обнаружены критические проблемы при проверке системы. Установка прервана."
@@ -598,6 +653,7 @@ action_change_provider() {
         return
     fi
 
+    detect_network_stack
     select_doh_provider
     if ! pretest_doh_upstream "$SELECTED_URL"; then
         err "Новый DoH-сервер не прошёл тест. Изменения не применены."
